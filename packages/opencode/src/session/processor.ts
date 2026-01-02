@@ -29,10 +29,12 @@ export namespace SessionProcessor {
     abort: AbortSignal
   }) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
+    const reasoningToolCalls: Record<string, MessageV2.ToolPart> = {} // Track tool calls during reasoning phase
     let snapshot: string | undefined
     let blocked = false
     let attempt = 0
     let needsCompaction = false
+    let isReasoningPhase = false // Track if we're currently in reasoning phase
 
     const result = {
       get message() {
@@ -59,6 +61,7 @@ export namespace SessionProcessor {
                   break
 
                 case "reasoning-start":
+                  isReasoningPhase = true // Enter reasoning phase
                   if (value.id in reasoningMap) {
                     continue
                   }
@@ -85,6 +88,7 @@ export namespace SessionProcessor {
                   break
 
                 case "reasoning-end":
+                  isReasoningPhase = false // Exit reasoning phase
                   if (value.id in reasoningMap) {
                     const part = reasoningMap[value.id]
                     part.text = part.text.trimEnd()
@@ -123,7 +127,11 @@ export namespace SessionProcessor {
                   break
 
                 case "tool-call": {
-                  const match = toolcalls[value.toolCallId]
+                  // Determine if this is a reasoning-phase tool call
+                  const isReasoningPhaseToolCall = isReasoningPhase && Object.keys(reasoningMap).length > 0
+                  const targetToolCalls = isReasoningPhaseToolCall ? reasoningToolCalls : toolcalls
+
+                  const match = targetToolCalls[value.toolCallId]
                   if (match) {
                     const part = await Session.updatePart({
                       ...match,
@@ -135,9 +143,12 @@ export namespace SessionProcessor {
                           start: Date.now(),
                         },
                       },
-                      metadata: value.providerMetadata,
+                      metadata: {
+                        ...value.providerMetadata,
+                        reasoningPhase: isReasoningPhaseToolCall, // Mark as reasoning-phase tool call
+                      },
                     })
-                    toolcalls[value.toolCallId] = part as MessageV2.ToolPart
+                    targetToolCalls[value.toolCallId] = part as MessageV2.ToolPart
 
                     const parts = await MessageV2.parts(input.assistantMessage.id)
                     const lastThree = parts.slice(-DOOM_LOOP_THRESHOLD)
@@ -169,7 +180,10 @@ export namespace SessionProcessor {
                   break
                 }
                 case "tool-result": {
-                  const match = toolcalls[value.toolCallId]
+                  // Check both regular and reasoning-phase tool calls
+                  const isReasoningPhaseToolCall = reasoningToolCalls[value.toolCallId] !== undefined
+                  const targetToolCalls = isReasoningPhaseToolCall ? reasoningToolCalls : toolcalls
+                  const match = targetToolCalls[value.toolCallId]
                   if (match && match.state.status === "running") {
                     await Session.updatePart({
                       ...match,
@@ -177,7 +191,10 @@ export namespace SessionProcessor {
                         status: "completed",
                         input: value.input,
                         output: value.output.output,
-                        metadata: value.output.metadata,
+                        metadata: {
+                          ...value.output.metadata,
+                          reasoningPhase: isReasoningPhaseToolCall,
+                        },
                         title: value.output.title,
                         time: {
                           start: match.state.time.start,
@@ -187,13 +204,27 @@ export namespace SessionProcessor {
                       },
                     })
 
-                    delete toolcalls[value.toolCallId]
+                    // If this was a reasoning-phase tool call, incorporate result into reasoning
+                    if (isReasoningPhaseToolCall && value.output.output) {
+                      const reasoningParts = Object.values(reasoningMap)
+                      if (reasoningParts.length > 0) {
+                        const currentReasoning = reasoningParts[reasoningParts.length - 1]
+                        const toolResultText = `\n[Tool: ${match.tool}] Result: ${value.output.output}\n`
+                        currentReasoning.text += toolResultText
+                        await Session.updatePart({ part: currentReasoning, delta: toolResultText })
+                      }
+                    }
+
+                    delete targetToolCalls[value.toolCallId]
                   }
                   break
                 }
 
                 case "tool-error": {
-                  const match = toolcalls[value.toolCallId]
+                  // Check both regular and reasoning-phase tool calls
+                  const isReasoningPhaseToolCall = reasoningToolCalls[value.toolCallId] !== undefined
+                  const targetToolCalls = isReasoningPhaseToolCall ? reasoningToolCalls : toolcalls
+                  const match = targetToolCalls[value.toolCallId]
                   if (match && match.state.status === "running") {
                     await Session.updatePart({
                       ...match,
@@ -208,10 +239,21 @@ export namespace SessionProcessor {
                       },
                     })
 
+                    // If this was a reasoning-phase tool call, incorporate error into reasoning
+                    if (isReasoningPhaseToolCall) {
+                      const reasoningParts = Object.values(reasoningMap)
+                      if (reasoningParts.length > 0) {
+                        const currentReasoning = reasoningParts[reasoningParts.length - 1]
+                        const toolErrorText = `\n[Tool: ${match.tool}] Error: ${(value.error as any).toString()}\n`
+                        currentReasoning.text += toolErrorText
+                        await Session.updatePart({ part: currentReasoning, delta: toolErrorText })
+                      }
+                    }
+
                     if (value.error instanceof PermissionNext.RejectedError) {
                       blocked = shouldBreak
                     }
-                    delete toolcalls[value.toolCallId]
+                    delete targetToolCalls[value.toolCallId]
                   }
                   break
                 }
@@ -380,6 +422,23 @@ export namespace SessionProcessor {
                   ...part.state,
                   status: "error",
                   error: "Tool execution aborted",
+                  time: {
+                    start: Date.now(),
+                    end: Date.now(),
+                  },
+                },
+              })
+            }
+          }
+          // Also clean up any pending reasoning-phase tool calls
+          for (const part of Object.values(reasoningToolCalls)) {
+            if (part.state.status !== "completed" && part.state.status !== "error") {
+              await Session.updatePart({
+                ...part,
+                state: {
+                  ...part.state,
+                  status: "error",
+                  error: "Tool execution aborted during reasoning",
                   time: {
                     start: Date.now(),
                     end: Date.now(),
